@@ -1,4 +1,4 @@
-#!/usr/bin/ruby
+#!/usr/bin/env ruby
 
 require 'optparse'
 require 'optparse/time'
@@ -18,10 +18,12 @@ class Optparser
     options.haproxy = []
     options.interval = 60
     options.samples = 10
-    options.cooldown = 300
+    options.cooldown = 5
     options.target_rps = 1000
     options.apps = Set.new
-    options.threshold_percent = 0.25
+    options.threshold_percent = 0.5
+    options.threshold_instances = 3
+    options.intervals_past_threshold = 3
 
     opt_parser = OptionParser.new do |opts|
       opts.banner = "Usage: autoscale.rb [options]"
@@ -36,7 +38,7 @@ class Optparser
 
       opts.on("--haproxy [URLs]",
               "Comma separate list of URLs for HAProxy. If this is a Mesos-DNS A-record, " +
-      "all backends will be polled.") do |value|
+              "all backends will be polled.") do |value|
         options.haproxy = value.split(/,/).map{|x|URI(x)}
       end
 
@@ -50,7 +52,7 @@ class Optparser
         options.samples = value
       end
 
-      opts.on("--cooldown Float", Float, "Number of additional seconds to wait after making " +
+      opts.on("--cooldown Integer", Float, "Number of additional intervals to wait after making " +
               "a scale change (Default: #{options.cooldown})") do |value|
         options.cooldown = value
       end
@@ -64,12 +66,23 @@ class Optparser
         options.apps.merge(value.split(/,/))
       end
 
-      opts.on("--threshold-percent Float", Float, "Scaling will occur when the target number " +
-              "of instances differs from the actual number by at least this amount (Default: " +
+      opts.on("--threshold-percent Float", Float, "Scaling will occur when the target RPS " +
+              "differs from the current RPS by at least this amount (Default: " +
               "#{options.threshold_percent})") do |value|
         options.threshold_percent = value
       end
 
+      opts.on("--threshold-instances Integer", Integer, "Scaling will occur when the target number " +
+              "of instances differs from the actual number by at least this amount (Default: " +
+              "#{options.threshold_instances})") do |value|
+        options.threshold_instances = value
+      end
+
+      opts.on("--intervals-past-threshold Integer", Integer, "An app won't be" +
+              " scaled until it's past it's threshold for this many intervals (Default: " +
+              "#{options.intervals_past_threshold})") do |value|
+        options.threshold_instances = value
+      end
 
       opts.separator ""
       opts.separator "Common options:"
@@ -91,6 +104,14 @@ class Autoscale
     @options = options
     @log = Logger.new(STDOUT)
     @log.level = Logger::INFO
+    @log.formatter = proc do |severity, datetime, progname, msg|
+      date_format = datetime.strftime("%FT%T")
+      if severity == "ERROR" or severity == "WARN"
+        "[#{date_format}] #{severity[0]}: #{msg}\n"
+      else
+        "[#{date_format}] #{msg}\n"
+      end
+    end
   end
 
   def run
@@ -101,35 +122,48 @@ class Autoscale
     @apps = {}
     @options.apps.each do |app|
       @apps[app] = {
-        :req_rate => [],
+        :rate => [],
+        :rate_avg => 0,
         :name => app,
         :last_scaled => 0,
+        :intervals_past_threshold => 0,
+        :current_instances => 0,
+        :target_instances => 0,
       }
     end
 
     total_samples = 0
     while true
-      haproxy_data = []
-      @options.haproxy.map do |haproxy|
-        Resolv.getaddresses(haproxy.host).each do |host|
-          uri = haproxy.clone
-          uri.host = host
-          haproxy_data << sample(uri)
+      begin
+        haproxy_data = []
+        @options.haproxy.map do |haproxy|
+          Resolv.getaddresses(haproxy.host).each do |host|
+            uri = haproxy.clone
+            uri.host = host
+            haproxy_data << sample(uri)
+          end
         end
+        aggregate_haproxy_data(haproxy_data)
+
+        update_current_marathon_instances
+
+        calculate_target_instances
+
+        if total_samples >= @options.samples
+          scale_list = build_scaling_list
+          if !scale_list.empty?
+            @log.info("#{scale_list.length} apps require scaling")
+          end
+
+          scale_apps(scale_list)
+        end
+
+        total_samples += 1
+      rescue Exception => msg
+        @log.error("Caught exception: " + msg.to_s)
+        @log.error(msg.backtrace)
       end
-      aggregate_haproxy_data(haproxy_data)
-
-      update_current_marathon_instances
-
-      calculate_target_instances
-
-      if total_samples >= @options.samples
-        scale_list = build_scaling_list
-
-        scale_apps(scale_list)
-      end
-
-      total_samples += 1
+      STDOUT.flush
       sleep @options.interval
     end
   end
@@ -168,7 +202,9 @@ class Autoscale
 
   def sample(haproxy)
     # Read from haproxy CSV endpoint
-    csv = Net::HTTP.get(haproxy.host, haproxy.path + '/haproxy?stats;csv', haproxy.port)
+    csv = Net::HTTP.get(haproxy.host,
+                        haproxy.path + '/haproxy?stats;csv',
+                        haproxy.port)
     csv = csv.split(/\r?\n/)
 
     header_labels = parse_haproxy_header_labels(csv)
@@ -184,21 +220,25 @@ class Autoscale
 
   def aggregate_haproxy_data(haproxy_data)
     @apps.each do |app,data|
-      if data[:req_rate].length >= @options.samples
-        data[:req_rate].rotate!
-        data[:req_rate].pop
+      if data[:rate].length >= @options.samples
+        data[:rate].rotate!
+        data[:rate].pop
       end
-      req_rate = 0
+      rate = 0
       haproxy_data.each do |d|
-        req_rate += d[app][:req_rate].to_i + d[app][:qcur].to_i
+        next if d[app].nil?
+        rate += d[app][:rate].to_i + d[app][:qcur].to_i
       end
-      data[:req_rate] << req_rate
-      data[:req_rate_avg] = data[:req_rate].inject(0.0) { |sum,el| sum + el } / data[:req_rate].size
+      data[:rate] << rate
+      data[:rate_avg] =
+        data[:rate].inject(0.0) { |sum,el| sum + el } / data[:rate].size
     end
   end
 
   def update_current_marathon_instances
-    apps = Net::HTTP.get(@options.marathon.host, @options.marathon.path + '/v2/apps', @options.marathon.port)
+    apps = Net::HTTP.get(@options.marathon.host,
+                         @options.marathon.path + '/v2/apps',
+                         @options.marathon.port)
     apps = JSON.parse(apps)
     instances = {}
     apps['apps'].each do |app|
@@ -217,25 +257,46 @@ class Autoscale
   def calculate_target_instances
     @apps.each do |app,data|
       data[:target_instances] =
-        (data[:req_rate_avg] / @options.target_rps).ceil
+        (data[:rate_avg] / @options.target_rps).ceil
     end
   end
 
   def build_scaling_list
     to_scale = {}
     @apps.each do |app,data|
-      # If the target and current instances don't match, we've exceed the threshold difference, and a scale operation wasn't performed recently
-      next if data[:target_instances] == data[:current_instances]
-      next if (data[:target_instances] - data[:current_instances]).abs.to_f / data[:current_instances] < @options.threshold_percent
-      next if data[:last_scaled] + @options.cooldown + @options.interval * @options.samples >= Time.now.to_i
       app_id = app.match(/(.*)_\d+$/)[1]
+      # Scale if: the target and current instances don't match, we've exceed the
+      # threshold difference, and a scale operation wasn't performed recently
+      if data[:target_instances] == data[:current_instances]
+        data[:intervals_past_threshold] = 0
+        next
+      end
+      if ((data[:rate_avg] / data[:current_instances]) - @options.target_rps).abs.to_f / @options.target_rps < @options.threshold_percent &&
+              (data[:target_instances] - data[:current_instances]).abs.to_f < @options.threshold_instances
+        data[:intervals_past_threshold] = 0
+        next
+      end
+      data[:intervals_past_threshold] += 1
+      if data[:intervals_past_threshold] < @options.intervals_past_threshold
+        next
+      end
+
+      if data[:last_scaled] + (@options.cooldown * @options.interval) +
+               @options.interval * @options.samples >= Time.now.to_f
+        @log.info("Not scaling #{app_id} yet because it needs to cool down (scaled #{(Time.now.to_f - data[:last_scaled]).round(1)}s ago)")
+        @log.info("app_id=#{app_id} rate_avg=#{data[:rate_avg]}/#{data[:current_instances]} " +
+                  "target_rps=#{@options.target_rps} current_rps=#{data[:rate_avg] / data[:current_instances]}")
+        next
+      end
       if to_scale.has_key?(app_id) && to_scale[app_id] > data[:target_instances]
         # If another frontend requires more instances than this one, do nothing
       else
-        @log.info("Scaling #{app_id} from #{data[:current_instances]} to #{data[:target_instances]} instances")
-        @log.info("app_id=#{app_id} req_rate_avg=#{data[:req_rate_avg]} target_rps=#{@options.target_rps} current_rps=#{data[:req_rate_avg] / data[:current_instances]}")
+        @log.info("Scaling #{app_id} from #{data[:current_instances]} to " +
+                  "#{data[:target_instances]} instances")
+        @log.info("app_id=#{app_id} rate_avg=#{data[:rate_avg]} " +
+                  "target_rps=#{@options.target_rps} current_rps=#{data[:rate_avg] / data[:current_instances]}")
         to_scale[app_id] = data[:target_instances]
-        data[:last_scaled] = Time.now.to_i
+        data[:last_scaled] = Time.now.to_f
       end
     end
     to_scale
@@ -243,9 +304,13 @@ class Autoscale
 
   def scale_apps(scale_list)
     scale_list.each do |app,instances|
-      req = Net::HTTP::Put.new(@options.marathon.path + '/v2/apps/' + app, initheader = { 'Content-Type' => 'application/json'})
+      req = Net::HTTP::Put.new(@options.marathon.path + '/v2/apps/' + app,
+                               initheader = { 'Content-Type' => 'application/json'})
       req.body = JSON.generate({'instances'=>instances})
-      response = Net::HTTP.new(@options.marathon.host, @options.marathon.port).start {|http| http.request(req) }
+      Net::HTTP.new(@options.marathon.host,
+                               @options.marathon.port).start do |http|
+        http.request(req)
+      end
     end
   end
 end
