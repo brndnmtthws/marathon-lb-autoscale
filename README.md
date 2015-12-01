@@ -43,7 +43,7 @@ Common options:
   "args":[
     "--marathon", "http://leader.mesos:8080",
     "--haproxy", "http://marathon-lb.marathon.mesos:9090",
-    "--apps", "nginx_9000"
+    "--apps", "nginx_10000"
   ],
   "cpus": 0.1,
   "mem": 16.0,
