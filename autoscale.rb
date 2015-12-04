@@ -133,6 +133,7 @@ class Autoscale
     end
 
     total_samples = 0
+    interval_started_at = Time.now.to_f
     while true
       begin
         haproxy_data = []
@@ -164,7 +165,8 @@ class Autoscale
         @log.error(msg.backtrace)
       end
       STDOUT.flush
-      sleep @options.interval
+      sleep([0, (interval_started_at + @options.interval) - Time.now.to_f].max)
+      interval_started_at = Time.now.to_f
     end
   end
 
