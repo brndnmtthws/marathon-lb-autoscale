@@ -259,7 +259,7 @@ class Autoscale
   def calculate_target_instances
     @apps.each do |app,data|
       data[:target_instances] =
-        (data[:rate_avg] / @options.target_rps).ceil
+        [(data[:rate_avg] / @options.target_rps).ceil, 1].max
     end
   end
 
