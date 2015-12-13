@@ -52,7 +52,7 @@ class Optparser
         options.samples = value
       end
 
-      opts.on("--cooldown Integer", Float, "Number of additional intervals to wait after making " +
+      opts.on("--cooldown Integer", Integer, "Number of additional intervals to wait after making " +
               "a scale change (Default: #{options.cooldown})") do |value|
         options.cooldown = value
       end
