@@ -24,6 +24,8 @@ class Optparser
     options.threshold_percent = 0.5
     options.threshold_instances = 3
     options.intervals_past_threshold = 3
+    options.marathonCredentials =  []
+    options.haproxyCredentials = []
 
     opt_parser = OptionParser.new do |opts|
       opts.banner = "Usage: autoscale.rb [options]"
@@ -66,6 +68,14 @@ class Optparser
         options.apps.merge(value.split(/,/))
       end
 
+      opts.on("--marathonCredentials [MarathonCredentials]", "Colon separated string of <username>:<password>") do |value|
+        options.marathonCredentials = value.split(/:/)
+      end
+
+      opts.on("--haproxyCredentials [HAProxyCredentials]", "Colon separated string of <username>:<password>") do |value|
+        options.haproxyCredentials = value.split(/:/)
+      end
+
       opts.on("--threshold-percent Float", Float, "Scaling will occur when the target RPS " +
               "differs from the current RPS by at least this amount (Default: " +
               "#{options.threshold_percent})") do |value|
@@ -81,7 +91,7 @@ class Optparser
       opts.on("--intervals-past-threshold Integer", Integer, "An app won't be" +
               " scaled until it's past it's threshold for this many intervals (Default: " +
               "#{options.intervals_past_threshold})") do |value|
-        options.threshold_instances = value
+        options.intervals_past_threshold = value
       end
 
       opts.separator ""
@@ -204,10 +214,17 @@ class Autoscale
 
   def sample(haproxy)
     # Read from haproxy CSV endpoint
-    csv = Net::HTTP.get(haproxy.host,
-                        haproxy.path + '/haproxy?stats;csv',
-                        haproxy.port)
-    csv = csv.split(/\r?\n/)
+    req = Net::HTTP::Get.new('/haproxy?stats;csv')
+    if !@options.haproxyCredentials.empty?
+      req.basic_auth @options.haproxyCredentials[0], @options.haproxyCredentials[1]
+    end
+
+    res = Net::HTTP.new(haproxy.host,
+                        haproxy.port).start do |http|
+      http.request(req)
+    end
+
+    csv = res.body.split(/\r?\n/)
 
     header_labels = parse_haproxy_header_labels(csv)
     frontends = parse_haproxy_frontends(csv, header_labels)
@@ -238,13 +255,20 @@ class Autoscale
   end
 
   def update_current_marathon_instances
-    apps = Net::HTTP.get(@options.marathon.host,
-                         @options.marathon.path + '/v2/apps',
-                         @options.marathon.port)
-    apps = JSON.parse(apps)
+    req = Net::HTTP::Get.new('/v2/apps')
+    if !@options.marathonCredentials.empty?
+      req.basic_auth @options.marathonCredentials[0], @options.marathonCredentials[1]
+    end
+
+    res = Net::HTTP.start(@options.marathon.host,
+                          @options.marathon.port) {|http|
+      http.request(req)
+    }
+    apps = JSON.parse(res.body)
+
     instances = {}
     apps['apps'].each do |app|
-      id = app['id'][1..-1] # trim leading '/'
+      id = app['id'][1..-1].gsub '/', '_' # trim leading '/'  # gsub add support for folders
       instances[id] = app['instances']
     end
     # Find our app backends
@@ -267,6 +291,8 @@ class Autoscale
     to_scale = {}
     @apps.each do |app,data|
       app_id = app.match(/(.*)_\d+$/)[1]
+      app_id = app_id.dup.gsub '_', '/' # support for folders.
+
       # Scale if: the target and current instances don't match, we've exceed the
       # threshold difference, and a scale operation wasn't performed recently
       if data[:target_instances] == data[:current_instances]
@@ -306,11 +332,15 @@ class Autoscale
 
   def scale_apps(scale_list)
     scale_list.each do |app,instances|
-      req = Net::HTTP::Put.new(@options.marathon.path + '/v2/apps/' + app,
-                               initheader = { 'Content-Type' => 'application/json'})
+      req = Net::HTTP::Put.new('/v2/apps/' + app)
+      if !@options.marathonCredentials.empty?
+        req.basic_auth @options.marathonCredentials[0], @options.marathonCredentials[1]
+      end
+      req.content_type 'application/json'
       req.body = JSON.generate({'instances'=>instances})
+
       Net::HTTP.new(@options.marathon.host,
-                               @options.marathon.port).start do |http|
+                    @options.marathon.port).start do |http|
         http.request(req)
       end
     end
@@ -320,3 +350,4 @@ end
 options = Optparser.parse(ARGV)
 autoscale = Autoscale.new(options)
 autoscale.run
+
